@@ -1,1397 +1,344 @@
-const express = require("express");
-const { addonBuilder } = require("stremio-addon-sdk");
-const sharp = require("sharp");
-const fs = require("fs");
-const path = require("path");
-const crypto = require("crypto");
+const express = require('express');
+const axios = require('axios');
+const sharp = require('sharp');
+const https = require('https');
+require('dotenv').config();
 
 const app = express();
-app.use((req, res, next) => {
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Headers", "*");
-    next();
-});
 
+// Configuración
 const TMDB_API_KEY = process.env.TMDB_API_KEY;
-const ADDON_URL = process.env.ADDON_URL;
+const ADDON_PORT = process.env.PORT || 3000;
+const ADDON_ID = 'org.stremio.top10tmdb';
 
-const imageCache = new Map();
-const tmdbCache = new Map();
-const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
-const TMDB_CACHE_TTL_MS = 10 * 60 * 1000;
-const CACHE_DIR = path.join(__dirname, "image-cache");
+// URLs de TMDB
+const TMDB_BASE = 'https://api.themoviedb.org/3';
+const POSTERS_PLUS_URL = 'https://postersplus.stremio.ru/poster';
 
-if (!fs.existsSync(CACHE_DIR)) {
-    fs.mkdirSync(CACHE_DIR, { recursive: true });
-}
+// Parámetros de PostersPlus (ajusta según necesites)
+const POSTERS_PARAMS = {
+  primary_client: 'stremio_tv_nuvio',
+  top_gradient: 'off',
+  bottom_gradient: 'off',
+  fallback_to_imdb: 'false',
+  rating_display_mode: '0',
+  frost_reference: 'true',
+  textless: 'false',
+  use_original_art: 'false',
+  original_art_source: 'primary',
+  logo_language: 'es-mx',
+  logo_priority: 'native_custom_text',
+  logo_language_secondary: 'es-es',
+  fallback_bg_style: 'photoreal',
+  logo_max_w_ratio: '0.75',
+  logo_max_h_ratio: '0.25',
+  logo_bottom_ratio: '0.28',
+  logo_bottom_anchor: 'true',
+  sash_mode: 'hidden',
+  cinema_greyscale: 'false',
+  cinema_greyscale_skip_if_available: 'false',
+  release_status_cinema_only: 'true',
+  badge_display_mode: '0'
+};
 
-function cacheFilePath(cacheKey) {
-    const hash = crypto.createHash("sha256").update(cacheKey).digest("hex");
-    return path.join(CACHE_DIR, `${hash}.png`);
-}
-
-async function fetchTmdbJson(url) {
-    const cached = tmdbCache.get(url);
-    if (cached && Date.now() < cached.expires) {
-        return cached.data;
-    }
-
-    const res = await fetch(url);
-    if (!res.ok) {
-        throw new Error(`TMDB fetch failed: ${res.status} ${res.statusText}`);
-    }
-    const data = await res.json();
-    tmdbCache.set(url, { data, expires: Date.now() + TMDB_CACHE_TTL_MS });
-    if (tmdbCache.size > 1000) {
-        const oldestKey = tmdbCache.keys().next().value;
-        tmdbCache.delete(oldestKey);
-    }
-    return data;
-}
-
-let genreMap = {};
-async function fetchGenres() {
-    try {
-        const [movieRes, tvRes] = await Promise.all([
-            fetchTmdbJson(`https://api.themoviedb.org/3/genre/movie/list?api_key=${TMDB_API_KEY}`),
-            fetchTmdbJson(`https://api.themoviedb.org/3/genre/tv/list?api_key=${TMDB_API_KEY}`)
-        ]);
-        if (movieRes.genres) movieRes.genres.forEach(g => genreMap[g.id] = g.name);
-        if (tvRes.genres) tvRes.genres.forEach(g => genreMap[g.id] = g.name);
-        console.log("Genres loaded successfully!");
-    } catch (error) { console.error("Failed to fetch genres:", error); }
-}
-fetchGenres();
-
+// ===== MANIFIESTO DEL ADDON =====
 const manifest = {
-    id: "com.trending.custom",
-    version: "1.12.2",
-    name: "TMDB Top Today",
-    description: "Customizable Stremio catalogs for top trending TMDB content with optional graphic tags and ranked posters.",
-    behaviorHints: { configurable: true, configurationRequired: true },
-    resources: ["catalog"],
-    types: ["movie", "series"],
-    idPrefixes: ["tmdb:"],
-    catalogs: [
-        { id: "top_movies_today", type: "movie", name: "Top Movies Today" },
-        { id: "top_shows_today", type: "series", name: "Top Shows Today" }
-    ]
+  id: ADDON_ID,
+  version: '1.0.0',
+  name: 'Top 15 TMDB - Trending',
+  description: 'Catálogo con el Top 15 Trending de películas y series de TMDB, con pósters numerados',
+  resources: ['catalog', 'meta'],
+  types: ['movie', 'series'],
+  catalogs: [
+    {
+      type: 'movie',
+      id: 'top15_movies',
+      name: 'Top 15 Películas - Trending',
+      extra: []
+    },
+    {
+      type: 'series',
+      id: 'top15_series',
+      name: 'Top 15 Series - Trending',
+      extra: []
+    }
+  ],
+  idPrefixes: ['tt'],
+  background: 'https://images.unsplash.com/photo-1506157786151-b8491531f063?w=1200&h=600&fit=crop',
+  logo: 'https://www.themoviedb.org/assets/2/v4/logos/v2/blue_long_2-9665a3b168cea5eb17046ca2beb76817c63d8f1b0fda8db32b46e00f457b3861.svg'
 };
 
-const builder = new addonBuilder(manifest);
-
-// ─── Date helpers ────────────────────────────────────────────────────────────
-
-const parseLocal = (dateStr) => {
-    if (!dateStr) return null;
-    if (dateStr.length === 10) return new Date(dateStr + "T00:00:00");
-    return new Date(dateStr);
-};
-
-const diffDays = (date1, date2) => {
-    const d1 = new Date(date1); d1.setHours(0, 0, 0, 0);
-    const d2 = new Date(date2); d2.setHours(0, 0, 0, 0);
-    return Math.round(Math.abs(d1 - d2) / (1000 * 60 * 60 * 24));
-};
-
-const formatFutureDate = (dateObj) => {
-    const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-    return `${monthNames[dateObj.getMonth()]} ${dateObj.getDate()}`;
-};
-
-const tagDisplayNameMap = {
-    "just_added": "Just Added",
-    "coming_soon": "Coming Soon",
-    "now_streaming": "Now Streaming",
-    "out_on_bluray": "Now on Blu-ray",
-    "premiere": "Premiere",
-    "new_series": "New Series",
-    "season_finale": "Season Finale",
-    "series_finale": "Series Finale",
-    "final_season": "Final Season",
-    "new_season": "New Season",
-    "new_episode": "New Episode"
-};
-
-// ─── Shared image-generation helpers ─────────────────────────────────────────
+// ===== FUNCIONES AUXILIARES =====
 
 /**
- * Resolve a tag string to its display text, or null if none.
+ * Obtiene una película o serie de TMDB con su IMDB ID
  */
-function parseTagText(tag) {
-    if (!tag || tag === 'none') return null;
-    if (tagDisplayNameMap[tag]) return tagDisplayNameMap[tag];
-    if (tag.startsWith('coming_date_')) {
-        const [month, day] = tag.replace('coming_date_', '').split('_');
-        return `Coming ${month} ${day}`;
-    }
-    if (tag.startsWith('finale_date_')) {
-        const [month, day] = tag.replace('finale_date_', '').split('_');
-        return `Finale ${month} ${day}`;
-    }
-    return null;
-}
-
-/**
- * Determine the best provider/network logo to show.
- * Returns { path, isNetwork } or null.
- */
-function resolveProviderLogoInfo(tmdbType, details) {
-    const cleanString = (str) => str ? str.toLowerCase().replace(/\+/g, 'plus').replace(/\s+/g, '') : '';
-    const customMappings = {
-        "hbo": "max", "cbs": "paramount", "nbc": "peacock",
-        "fx": "hulu", "abc": "hulu", "fox": "hulu",
-        "amc": "amc", "showtime": "paramount", "the cw": "max", "bbc": "britbox"
-    };
-    const topTiers = ['netflix', 'max', 'disney', 'hulu', 'apple', 'paramount', 'peacock',
-        'crunchyroll', 'mgm', 'starz', 'showtime', 'amc', 'amazon'];
-
-    let usProviders = null;
-    if (details['watch/providers']?.results) {
-        const providers = details['watch/providers'].results;
-        usProviders = providers.US;
-    }
-
-    // Pre-filter flatrate providers to exclude channel/store-within-a-store versions
-    const validFlatrate = (usProviders?.flatrate || []).filter(p => {
-        const pName = cleanString(p.provider_name);
-        return !((pName.includes('amazon') && pName.includes('channel')) ||
-            (pName.includes('roku') && pName.includes('premium')) ||
-            (pName.includes('apple') && pName.includes('channel')));
+async function getTMDBItem(tmdbId, type) {
+  try {
+    const endpoint = type === 'movie' ? 'movie' : 'tv';
+    const response = await axios.get(`${TMDB_BASE}/${endpoint}/${tmdbId}`, {
+      params: {
+        api_key: TMDB_API_KEY,
+        language: 'es-MX'
+      }
     });
 
-    // 1. Match TV network → streaming provider
-    if (tmdbType === 'tv' && details.networks?.length > 0) {
-        const networkName = details.networks[0].name;
-        const targetProvider = customMappings[networkName.toLowerCase()] || cleanString(networkName);
-        if (validFlatrate.length > 0) {
-            const matched = validFlatrate.find(p => {
-                const pName = cleanString(p.provider_name);
-                return pName.includes(targetProvider) || targetProvider.includes(pName);
-            });
-            if (matched) return { path: matched.logo_path, isNetwork: false };
-        }
-    }
+    const data = response.data;
+    const externalIds = await axios.get(
+      `${TMDB_BASE}/${endpoint}/${tmdbId}/external_ids`,
+      { params: { api_key: TMDB_API_KEY } }
+    );
 
-    // 2. Pick best flatrate streaming provider
-    if (validFlatrate.length > 0) {
-        let best = null, bestIdx = Infinity;
-        for (const p of validFlatrate) {
-            const idx = topTiers.findIndex(t => cleanString(p.provider_name).includes(t));
-            if (idx !== -1 && idx < bestIdx) { bestIdx = idx; best = p; }
-        }
-        if (!best) {
-            best = validFlatrate.find(p => !cleanString(p.provider_name).includes('amazon')) || validFlatrate[0];
-        }
-        return { path: best.logo_path, isNetwork: false };
-    }
-
-    // 3. Fallback: raw network logo
-    if (tmdbType === 'tv' && details.networks?.length > 0) {
-        return { path: details.networks[0].logo_path, isNetwork: true };
-    }
-
+    return {
+      id: externalIds.data.imdb_id,
+      tmdbId,
+      type,
+      name: type === 'movie' ? data.title : data.name,
+      description: data.overview,
+      poster: data.poster_path,
+      rating: data.vote_average,
+      year: type === 'movie'
+        ? new Date(data.release_date).getFullYear()
+        : new Date(data.first_air_date).getFullYear(),
+      imdbId: externalIds.data.imdb_id
+    };
+  } catch (error) {
+    console.error(`Error fetching item ${tmdbId}:`, error.message);
     return null;
+  }
 }
 
 /**
- * Sample the average color of the bottom half of an image.
- * Uses raw pixel data — avoids a full PNG encode/decode cycle.
- * Returns { meanR, meanG, meanB, luminance }.
+ * Obtiene el top 10 trending de TMDB
  */
-async function sampleBottomHalf(imageBuffer, metadata) {
-    try {
-        const top = Math.floor(metadata.height / 2);
-        const height = metadata.height - top;
+async function getTopTrending(type, limit = 15) {
+  try {
+    const endpoint = type === 'movie' ? 'movie' : 'tv';
+    const response = await axios.get(`${TMDB_BASE}/trending/${endpoint}/week`, {
+      params: {
+        api_key: TMDB_API_KEY,
+        language: 'es-MX'
+      }
+    });
 
-        const { data, info } = await sharp(imageBuffer)
-            .extract({ left: 0, top, width: metadata.width, height })
-            .raw()
-            .toBuffer({ resolveWithObject: true });
+    const results = response.data.results.slice(0, limit);
+    const items = [];
 
-        const channels = info.channels; // 3 (RGB) or 4 (RGBA)
-        const pixelCount = info.width * info.height;
-        let sumR = 0, sumG = 0, sumB = 0;
+    for (let i = 0; i < results.length; i++) {
+      const item = await getTMDBItem(results[i].id, type);
+      if (item) {
+        item.rank = i + 1; // Agregar ranking
+        items.push(item);
+      }
+    }
 
-        for (let i = 0; i < data.length; i += channels) {
-            sumR += data[i];
-            sumG += data[i + 1];
-            sumB += data[i + 2];
+    return items;
+  } catch (error) {
+    console.error('Error fetching trending:', error.message);
+    return [];
+  }
+}
+
+/**
+ * Construye URL de PostersPlus
+ */
+function buildPostersUrl(tmdbId, imdbId, type, rank) {
+  const params = new URLSearchParams({
+    ...POSTERS_PARAMS,
+    tmdb_id: tmdbId,
+    imdb_id: imdbId || '',
+    type: type === 'movie' ? 'movie' : 'tv'
+  });
+
+  // Agregamos el rank como parámetro personalizado (PostersPlus puede ignorarlo)
+  params.append('_rank', rank);
+
+  return `${POSTERS_PLUS_URL}?${params.toString()}`;
+}
+
+/**
+ * Obtiene imagen de PostersPlus y superpone el número
+ */
+async function generateRankedPoster(posterUrl, rank) {
+  try {
+    // Obtener imagen de PostersPlus
+    const response = await axios.get(posterUrl, {
+      responseType: 'arraybuffer',
+      httpsAgent: new https.Agent({ rejectUnauthorized: false })
+    });
+
+    const imageBuffer = Buffer.from(response.data, 'binary');
+
+    // Crear SVG overlay con el número (aumentado para números de 2 dígitos)
+    const rankSvg = `
+      <svg width="240" height="240">
+        <circle cx="120" cy="120" r="110" fill="rgba(0, 0, 0, 0.8)"/>
+        <text x="120" y="145" font-size="160" font-weight="bold" fill="white" text-anchor="middle" font-family="Arial, sans-serif">
+          ${rank}
+        </text>
+      </svg>
+    `;
+
+    // Superponer en la esquina superior izquierda
+    const result = await sharp(imageBuffer)
+      .composite([
+        {
+          input: Buffer.from(rankSvg),
+          top: 10,
+          left: 10,
+          blend: 'over'
         }
+      ])
+      .webp({ quality: 80 })
+      .toBuffer();
 
-        const meanR = Math.round(sumR / pixelCount);
-        const meanG = Math.round(sumG / pixelCount);
-        const meanB = Math.round(sumB / pixelCount);
-        const luminance = (0.299 * meanR) + (0.587 * meanG) + (0.114 * meanB);
-        return { meanR, meanG, meanB, luminance };
-    } catch {
-        return { meanR: 26, meanG: 26, meanB: 26, luminance: 26 };
-    }
+    return result;
+  } catch (error) {
+    console.error('Error generating ranked poster:', error.message);
+    // Retornar imagen original si falla
+    return await axios.get(posterUrl, { responseType: 'arraybuffer' })
+      .then(r => Buffer.from(r.data, 'binary'))
+      .catch(() => null);
+  }
 }
 
+// ===== RUTAS DEL ADDON =====
+
 /**
- * Estimate rendered text width given a font size.
+ * Manifiesto (requerido por Stremio)
  */
-function estimateTextWidth(text, fontSize) {
-    let w = 0;
-    for (const char of text) {
-        if ("iIl1., -".includes(char)) w += fontSize * 0.25;
-        else if ("rftj".includes(char)) w += fontSize * 0.35;
-        else if ("WMwm@".includes(char)) w += fontSize * 0.85;
-        else if ("NQDOUCGRHKBAVXY".includes(char)) w += fontSize * 0.70;
-        else if ("PESZT".includes(char)) w += fontSize * 0.60;
-        else w += fontSize * 0.50;
+app.get('/manifest.json', (req, res) => {
+  res.json(manifest);
+});
+
+/**
+ * Catálogos
+ */
+app.get('/catalog/:type/:id', async (req, res) => {
+  const { type, id } = req.params;
+
+  try {
+    const isMovie = id === 'top15_movies';
+    const isTV = id === 'top15_series';
+
+    if (!isMovie && !isTV) {
+      return res.status(404).json({ error: 'Catálogo no encontrado' });
     }
-    return w;
-}
+
+    const contentType = isMovie ? 'movie' : 'series';
+    const items = await getTopTrending(contentType, 15);
+
+    const metas = items.map(item => ({
+      id: item.imdbId,
+      type: item.type,
+      name: `${item.rank}. ${item.name}`,
+      poster: `/poster/${item.tmdbId}/${item.imdbId}/${item.type}/${item.rank}`,
+      description: item.description,
+      rating: Math.round(item.rating * 10) / 10,
+      year: item.year
+    }));
+
+    res.json({ metas });
+  } catch (error) {
+    console.error('Error in catalog route:', error);
+    res.status(500).json({ error: 'Error obteniendo catálogo' });
+  }
+});
 
 /**
- * Build the frosted-glass tag composite operations for a given image.
- * The blur extraction and color sampling run in parallel.
- *
- * @param {Buffer} imageBuffer  - Source image buffer
- * @param {object} metadata     - sharp metadata for imageBuffer
- * @param {string} tagText      - Display string for the tag
- * @param {number} heightRatio  - Tag height as fraction of image height (0.08 poster / 0.15 backdrop)
- * @param {number} fontRatio    - Font size as fraction of tag height (0.60 poster / 0.75 backdrop)
- * @returns {Promise<Array>}    - Array of sharp composite operation objects
+ * Ruta personalizada para pósters con número superpuesto
  */
-async function buildTagComposites(imageBuffer, metadata, tagText, heightRatio, fontRatio) {
-    const { width, height } = metadata;
-    const tagHeight = Math.round(height * heightRatio);
-    const fontSize = Math.round(tagHeight * fontRatio);
-    const tagWidth = Math.round(estimateTextWidth(tagText, fontSize) + fontSize * 1.8);
-    const startX = Math.round((width / 2) - (tagWidth / 2));
-    const startY = height - tagHeight;
-    const r = Math.round(tagHeight * 0.25);
+app.get('/poster/:tmdbId/:imdbId/:type/:rank', async (req, res) => {
+  const { tmdbId, imdbId, type, rank } = req.params;
 
-    const extractLeft = Math.max(0, startX);
-    const extractTop = Math.max(0, startY);
-    const extractWidth = Math.min(tagWidth, width - extractLeft);
-    const extractHeight = Math.min(tagHeight, height - extractTop);
+  try {
+    const posterUrl = buildPostersUrl(tmdbId, imdbId, type, parseInt(rank));
+    const rankedImage = await generateRankedPoster(posterUrl, rank);
 
-    // ── Run color sampling and region blur in parallel ───────────────────────
-    const [colorInfo, blurBuffer] = await Promise.all([
-        sampleBottomHalf(imageBuffer, metadata),
-        sharp(imageBuffer)
-            .extract({ left: extractLeft, top: extractTop, width: extractWidth, height: extractHeight })
-            .blur(15)
-            .png()
-            .toBuffer()
-            .catch(() => null)
-    ]);
-
-    const { meanR, meanG, meanB, luminance } = colorInfo;
-
-    const textColor = luminance > 140 ? "#121212" : "#ffffff";
-
-    // Blend the sampled color with white if text is black, otherwise grey
-    const greyMixFactor = 0.25;
-    const blendTarget = textColor === "#121212" ? 255 : 128;
-    const adjR = Math.round(meanR + (blendTarget - meanR) * greyMixFactor);
-    const adjG = Math.round(meanG + (blendTarget - meanG) * greyMixFactor);
-    const adjB = Math.round(meanB + (blendTarget - meanB) * greyMixFactor);
-
-    const tagFillColor = `rgb(${adjR}, ${adjG}, ${adjB})`;
-    let tagFillOpacity = "0.45";
-
-    const composites = [];
-    const fontStack = "'SF Pro Display', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif";
-
-    // ── Frosted blur region ──────────────────────────────────────────────────
-    if (blurBuffer) {
-        const localPath = `M 0,${extractHeight} L ${extractWidth},${extractHeight} L ${extractWidth},${r} Q ${extractWidth},0 ${extractWidth - r},0 L ${r},0 Q 0,0 0,${r} Z`;
-        const maskSvg = `<svg width="${extractWidth}" height="${extractHeight}"><path d="${localPath}" fill="white"/></svg>`;
-
-        const shapedBlur = await sharp(blurBuffer)
-            .composite([{ input: Buffer.from(maskSvg), blend: 'dest-in' }])
-            .png()
-            .toBuffer();
-        composites.push({ input: shapedBlur, top: extractTop, left: extractLeft });
+    if (rankedImage) {
+      res.set('Content-Type', 'image/webp');
+      res.set('Cache-Control', 'public, max-age=86400');
+      res.send(rankedImage);
     } else {
-        tagFillOpacity = "0.85";
+      // Redirigir a PostersPlus si falla la generación
+      res.redirect(posterUrl);
     }
-
-    // ── Pill + text overlay ──────────────────────────────────────────────────
-    const pillPath = `M ${startX},${height} L ${startX + tagWidth},${height} L ${startX + tagWidth},${startY + r} Q ${startX + tagWidth},${startY} ${startX + tagWidth - r},${startY} L ${startX + r},${startY} Q ${startX},${startY} ${startX},${startY + r} Z`;
-    const tagSvg = `<svg width="${width}" height="${height}">
-        <path d="${pillPath}" fill="${tagFillColor}" fill-opacity="${tagFillOpacity}"/>
-        <text x="${width / 2}" y="${startY + (tagHeight / 2) + (fontSize * 0.35)}" text-anchor="middle"
-              font-family="${fontStack}" font-size="${fontSize}" fill="${textColor}" font-weight="bold">${tagText}</text>
-    </svg>`;
-    composites.push({ input: Buffer.from(tagSvg), top: 0, left: 0 });
-
-    return composites;
-}
+  } catch (error) {
+    console.error('Error generating poster:', error);
+    res.status(500).json({ error: 'Error generando póster' });
+  }
+});
 
 /**
- * Fetch, resize, and optionally round-corner a provider logo.
- * Returns a composite operation object, or null on failure.
- *
- * @param {string}  logoPath   - TMDB logo_path
- * @param {boolean} isNetwork  - Skip rounding for raw network logos
- * @param {number}  logoWidth  - Target pixel width
- * @param {number}  topOffset  - Composite top position
- * @param {number}  rightEdge  - Full image width (used to compute left position)
- * @param {number}  rightPad   - Padding from right edge
+ * Meta (información de items individuales)
  */
-async function buildLogoComposite(logoPath, isNetwork, logoWidth, topOffset, rightEdge, rightPad) {
-    try {
-        const res = await fetch(`https://image.tmdb.org/t/p/w154${logoPath}`);
-        if (!res.ok) return null;
+app.get('/meta/:type/:id', async (req, res) => {
+  const { type, id } = req.params;
 
-        const buf = Buffer.from(await res.arrayBuffer());
-        let resized = await sharp(buf)
-            .resize({ width: logoWidth, withoutEnlargement: true })
-            .png()
-            .toBuffer();
-
-        const meta = await sharp(resized).metadata();
-
-        if (!isNetwork) {
-            const maskRadius = Math.round(logoWidth * 0.2);
-            const mask = Buffer.from(`<svg width="${meta.width}" height="${meta.height}">
-                <rect x="0" y="0" width="${meta.width}" height="${meta.height}"
-                      rx="${maskRadius}" ry="${maskRadius}" fill="white"/>
-            </svg>`);
-            resized = await sharp(resized)
-                .composite([{ input: mask, blend: 'dest-in' }])
-                .png()
-                .toBuffer();
-        }
-
-        return {
-            input: resized,
-            top: topOffset,
-            left: Math.round(rightEdge - meta.width - rightPad)
-        };
-    } catch (e) {
-        console.error("Provider logo error:", e);
-        return null;
+  try {
+    // Convertir IMDB ID a TMDB ID
+    const tmdbId = await getTMDBIdFromImdb(id);
+    if (!tmdbId) {
+      return res.status(404).json({ error: 'No encontrado' });
     }
-}
+
+    const item = await getTMDBItem(tmdbId, type);
+    if (!item) {
+      return res.status(404).json({ error: 'No encontrado' });
+    }
+
+    res.json({
+      meta: {
+        id: item.imdbId,
+        type: item.type,
+        name: item.name,
+        poster: buildPostersUrl(item.tmdbId, item.imdbId, item.type, 0),
+        description: item.description,
+        rating: item.rating,
+        year: item.year
+      }
+    });
+  } catch (error) {
+    console.error('Error in meta route:', error);
+    res.status(500).json({ error: 'Error obteniendo información' });
+  }
+});
 
 /**
- * Shared cache middleware + probabilistic cache cleanup.
- * Returns true if the request was served from cache (caller should return early).
+ * Obtener TMDB ID desde IMDB ID
  */
-async function serveCached(cacheKey, res) {
-    const cached = imageCache.get(cacheKey);
-    if (cached && Date.now() < cached.expires) {
-        res.set("Content-Type", "image/png");
-        res.set("Cache-Control", "public, max-age=86400");
-        res.send(cached.buffer);
-        return true;
-    }
-
-    const filePath = cacheFilePath(cacheKey);
-    try {
-        const stats = await fs.promises.stat(filePath);
-        if (Date.now() < stats.mtimeMs + CACHE_TTL_MS) {
-            const buffer = await fs.promises.readFile(filePath);
-            imageCache.set(cacheKey, { buffer, expires: Date.now() + CACHE_TTL_MS });
-            res.set("Content-Type", "image/png");
-            res.set("Cache-Control", "public, max-age=86400");
-            res.send(buffer);
-            return true;
-        }
-    } catch (err) {
-        // ignore missing cache file
-    }
-
-    if (Math.random() < 0.05) {
-        for (const [k, v] of imageCache.entries()) {
-            if (Date.now() > v.expires) imageCache.delete(k);
-        }
-    }
-    return false;
-}
-
-function cacheAndSend(cacheKey, buffer, res) {
-    imageCache.set(cacheKey, { buffer, expires: Date.now() + CACHE_TTL_MS });
-    fs.promises.writeFile(cacheFilePath(cacheKey), buffer).catch(() => { });
-    if (imageCache.size > 500) {
-        const oldestKey = imageCache.keys().next().value;
-        imageCache.delete(oldestKey);
-    }
-    res.set("Content-Type", "image/png");
-    res.set("Cache-Control", "public, max-age=86400");
-    res.send(buffer);
-}
-
-// ─── Catalog handler (unchanged logic) ───────────────────────────────────────
-
-builder.defineCatalogHandler(async (args) => {
-    const { type, id, extra } = args;
-    const config = extra?.config || {};
-
-    const userConfig = {
-        landscapeTags: config.landscapeTags !== undefined ? config.landscapeTags !== "false" : config.tags !== "false",
-        landscapeLogos: config.landscapeLogos !== undefined ? config.landscapeLogos === "true" : config.logos === "true",
-        landscapeRanked: config.landscapeRanked === "true",
-        landscapePosterLang: config.landscapePosterLang || config.posterLang || "en",
-        portraitTags: config.portraitTags !== undefined ? config.portraitTags !== "false" : config.tags !== "false",
-        portraitLogos: config.portraitLogos !== undefined ? config.portraitLogos === "true" : config.logos === "true",
-        portraitRanked: config.portraitRanked !== undefined ? config.portraitRanked !== "false" : config.ranked !== "false",
-        portraitPosterLang: config.portraitPosterLang || config.posterLang || "en",
-        digitalOnly: config.digitalOnly !== "false",
-        listLang: config.listLang || "en"
-    };
-
-    const tmdbType = type === 'series' ? 'tv' : 'movie';
-    let finalItems = [];
-    let seenIds = new Set();
-    let page = 1;
-    const maxPages = 10;
-    const TODAY = new Date();
-
-    while (finalItems.length < 10 && page <= maxPages) {
-        const data = await fetchTmdbJson(`https://api.themoviedb.org/3/trending/${tmdbType}/day?api_key=${TMDB_API_KEY}&page=${page}`);
-        if (!data.results || data.results.length === 0) break;
-
-        let pageItems = data.results.filter(item => {
-            if (seenIds.has(item.id)) return false;
-
-            const langs = userConfig.listLang.split(',');
-            let keep = false;
-            if (langs.includes('all')) keep = true;
-            else if (langs.includes('non-en') && item.original_language !== 'en') keep = true;
-            else if (langs.includes(item.original_language)) keep = true;
-
-            if (!keep) return false;
-
-            seenIds.add(item.id);
-            return true;
-        });
-
-        if (pageItems.length > 0) {
-            const detailsData = await Promise.all(pageItems.map(async (item) => {
-                try {
-                    return await fetchTmdbJson(`https://api.themoviedb.org/3/${tmdbType}/${item.id}?api_key=${TMDB_API_KEY}&append_to_response=external_ids`);
-                } catch { return null; }
-            }));
-            pageItems.forEach((item, index) => item._details = detailsData[index]);
-        }
-
-        if (type === 'movie' && pageItems.length > 0) {
-            const releaseDatesData = await Promise.all(pageItems.map(async (movie) => {
-                try {
-                    const releaseData = await fetchTmdbJson(`https://api.themoviedb.org/3/movie/${movie.id}/release_dates?api_key=${TMDB_API_KEY}`);
-
-                    let earliestTheatrical = null;
-                    let earliestDigital = null;
-                    let earliestPhysical = null;
-
-                    if (releaseData.results) {
-                        const usData = releaseData.results.find(c => c.iso_3166_1 === 'US');
-                        const globalDates = releaseData.results.flatMap(c => c.release_dates);
-
-                        const findEarliest = (releases, types) => {
-                            let earliest = null;
-                            for (const r of releases) {
-                                if (types.includes(r.type)) {
-                                    const d = parseLocal(r.release_date.substring(0, 10));
-                                    if (!earliest || d < earliest) earliest = d;
-                                }
-                            }
-                            return earliest;
-                        };
-
-                        const usReleases = usData ? usData.release_dates : [];
-                        earliestTheatrical = findEarliest(usReleases, [1, 2, 3]) || findEarliest(globalDates, [1, 2, 3]);
-                        earliestDigital = findEarliest(usReleases, [4]) || findEarliest(globalDates, [4]);
-                        earliestPhysical = findEarliest(usReleases, [5]) || findEarliest(globalDates, [5]);
-                    }
-                    return { earliestTheatrical, earliestDigital, earliestPhysical };
-                } catch { return { earliestTheatrical: null, earliestDigital: null, earliestPhysical: null }; }
-            }));
-
-            pageItems.forEach((item, index) => {
-                const dates = releaseDatesData[index] || {};
-                item._earliestTheatrical = dates.earliestTheatrical;
-                item._earliestDigital = dates.earliestDigital;
-                item._earliestPhysical = dates.earliestPhysical;
-            });
-
-            if (userConfig.digitalOnly) {
-                pageItems = pageItems.filter(item => {
-                    // Prevent TMDB metadata errors: if a future digital release exists,
-                    // it is not truly out yet, regardless of erroneous past physical dates.
-                    if (item._earliestDigital && item._earliestDigital > TODAY) return false;
-
-                    const hasDigital = item._earliestDigital && item._earliestDigital <= TODAY;
-                    const hasPhysical = item._earliestPhysical && item._earliestPhysical <= TODAY;
-                    return hasDigital || hasPhysical;
-                });
-            }
-
-            pageItems.forEach(item => {
-                const needsTags = userConfig.landscapeTags || userConfig.portraitTags;
-                if (needsTags) {
-                    const daysSincePhysical = (item._earliestPhysical && item._earliestPhysical <= TODAY) ? diffDays(TODAY, item._earliestPhysical) : null;
-                    const daysSinceDigital = (item._earliestDigital && item._earliestDigital <= TODAY) ? diffDays(TODAY, item._earliestDigital) : null;
-
-                    if (daysSincePhysical !== null && daysSincePhysical <= 14) {
-                        item._tag = "out_on_bluray";
-                    } else if (daysSinceDigital !== null && daysSinceDigital <= 14) {
-                        item._tag = (item._earliestTheatrical && item._earliestTheatrical < item._earliestDigital)
-                            ? "just_added" : "now_streaming";
-                    } else if (!item._earliestDigital || item._earliestDigital > TODAY) {
-                        if (item._earliestDigital) {
-                            const daysUntil = diffDays(item._earliestDigital, TODAY);
-                            if (daysUntil <= 14) {
-                                const formattedDate = formatFutureDate(item._earliestDigital);
-                                item._tag = `coming_date_${formattedDate.replace(' ', '_')}`;
-                            } else {
-                                item._tag = "coming_soon";
-                            }
-                        } else {
-                            item._tag = "coming_soon";
-                        }
-                    } else {
-                        item._tag = "none";
-                    }
-                } else {
-                    item._tag = "none";
-                }
-            });
-
-        } else if (type === 'series' && pageItems.length > 0) {
-            const needsTags = userConfig.landscapeTags || userConfig.portraitTags;
-            if (needsTags) {
-                const tvDetailsData = await Promise.all(pageItems.map(async (show) => {
-                    try {
-                        const data = await fetchTmdbJson(`https://api.themoviedb.org/3/tv/${show.id}?api_key=${TMDB_API_KEY}&append_to_response=external_ids`);
-
-                        let nextEp = data.next_episode_to_air;
-                        if (nextEp && nextEp.air_date) {
-                            const nextAirDate = parseLocal(nextEp.air_date);
-                            if (nextAirDate <= TODAY) {
-                                const currentSeason = data.seasons?.find(s => s.season_number === nextEp.season_number);
-                                const expectedCount = currentSeason?.episode_count || 0;
-                                if (expectedCount > 0 && nextEp.episode_number < expectedCount) {
-                                    try {
-                                        const seasonData = await fetchTmdbJson(`https://api.themoviedb.org/3/tv/${show.id}/season/${nextEp.season_number}?api_key=${TMDB_API_KEY}`);
-                                        if (seasonData.episodes) {
-                                            const validEps = seasonData.episodes.filter(ep => ep.air_date && parseLocal(ep.air_date) <= TODAY);
-                                            if (validEps.length > 0) {
-                                                const latest = validEps[validEps.length - 1];
-                                                if (latest.episode_number > nextEp.episode_number) {
-                                                    data.next_episode_to_air = latest;
-                                                }
-                                            }
-                                        }
-                                    } catch { /* ignore */ }
-                                }
-                            }
-                        }
-                        return data;
-                    } catch { return null; }
-                }));
-
-                pageItems.forEach((item, index) => {
-                    const tvData = tvDetailsData[index];
-                    if (!tvData) return;
-                    item._details = tvData; // Ensure details are attached for later use
-
-                    let lastEp = tvData.last_episode_to_air;
-                    let nextEp = tvData.next_episode_to_air;
-
-                    if (nextEp && nextEp.air_date) {
-                        const nextAirDate = parseLocal(nextEp.air_date);
-                        if (nextAirDate <= TODAY) { lastEp = nextEp; nextEp = null; }
-                    }
-
-                    let isFinale = false;
-                    if (lastEp) {
-                        const currentSeason = tvData.seasons?.find(s => s.season_number === lastEp.season_number);
-                        const expectedCount = currentSeason?.episode_count || 0;
-                        if (lastEp.episode_type) {
-                            isFinale = lastEp.episode_type === "finale";
-                        } else if (expectedCount > 0 && lastEp.episode_number >= expectedCount) {
-                            isFinale = true;
-                        } else if (!nextEp && lastEp.episode_number > 1) {
-                            if (expectedCount === 0 || lastEp.episode_number >= expectedCount) isFinale = true;
-                        }
-                    }
-
-                    const firstAir = parseLocal(tvData.first_air_date);
-                    const lastAir = lastEp?.air_date ? parseLocal(lastEp.air_date) : parseLocal(tvData.last_air_date);
-
-                    let itemTag = null, futureDate = null, isBrandNewSeries = false;
-
-                    if (firstAir && firstAir > TODAY) {
-                        futureDate = firstAir;
-                        isBrandNewSeries = true;
-                    } else if (nextEp && nextEp.episode_number === 1) {
-                        futureDate = parseLocal(nextEp.air_date);
-                    }
-
-                    if (futureDate) {
-                        const daysUntil = diffDays(futureDate, TODAY);
-                        if (daysUntil <= 14) {
-                            itemTag = `coming_date_${formatFutureDate(futureDate).replace(' ', '_')}`;
-                        } else if (isBrandNewSeries) {
-                            itemTag = "coming_soon";
-                        }
-                    }
-
-                    if (!itemTag && nextEp?.air_date) {
-                        const nextAirDate = parseLocal(nextEp.air_date);
-                        if (nextAirDate > TODAY && diffDays(nextAirDate, TODAY) <= 5) {
-                            const nextSeason = tvData.seasons?.find(s => s.season_number === nextEp.season_number);
-                            const expectedCount = nextSeason?.episode_count || 0;
-                            let isNextFinale = nextEp.episode_type
-                                ? nextEp.episode_type === "finale"
-                                : (expectedCount > 0 && nextEp.episode_number >= expectedCount);
-                            if (isNextFinale) {
-                                itemTag = `finale_date_${formatFutureDate(nextAirDate).replace(' ', '_')}`;
-                            }
-                        }
-                    }
-
-                    if (!itemTag) {
-                        const latestSeason = tvData.seasons?.slice().reverse().find(s => s.season_number > 0);
-                        const seasonAir = latestSeason?.air_date ? parseLocal(latestSeason.air_date) : null;
-
-                        if (firstAir && firstAir <= TODAY && diffDays(TODAY, firstAir) <= 6) {
-                            itemTag = "premiere";
-                        } else if (firstAir && firstAir <= TODAY && diffDays(TODAY, firstAir) <= 13) {
-                            itemTag = "new_series";
-                        } else if (seasonAir && seasonAir <= TODAY && diffDays(TODAY, seasonAir) <= 13) {
-                            itemTag = "new_season";
-                        } else if (isFinale && lastAir && lastAir <= TODAY && diffDays(TODAY, lastAir) <= 13) {
-                            if (tvData.status === "Ended" || tvData.status === "Canceled") {
-                                itemTag = "series_finale";
-                            } else {
-                                itemTag = "season_finale";
-                            }
-                        } else if (lastAir && lastAir <= TODAY && diffDays(TODAY, lastAir) <= 6) {
-                            itemTag = "new_episode";
-                        } else if ((tvData.status === "Ended" || tvData.status === "Canceled") &&
-                            tvData.number_of_seasons > 1 && lastAir && lastAir <= TODAY && diffDays(TODAY, lastAir) <= 30) {
-                            itemTag = "final_season";
-                        }
-                    }
-
-                    item._tag = itemTag || "none";
-                });
-            } else {
-                pageItems.forEach(item => item._tag = "none");
-            }
-        }
-
-        finalItems.push(...pageItems);
-        page++;
-    }
-
-    const metas = finalItems.slice(0, 10).map((item, index) => {
-        const rank = index + 1;
-        let finalPosterUrl = item.poster_path ? `https://image.tmdb.org/t/p/w500${item.poster_path}` : null;
-        const imdbId = item._details?.imdb_id || item._details?.external_ids?.imdb_id;
-
-        const pTag = userConfig.portraitTags ? (item._tag || 'none') : 'none';
-        if (userConfig.portraitRanked || userConfig.portraitTags || userConfig.portraitLogos || userConfig.portraitPosterLang !== 'en') {
-            finalPosterUrl = `${ADDON_URL}/proxy-image-poster/${type}/${item.id}/${pTag}/${userConfig.portraitRanked ? rank : 'none'}/${userConfig.portraitPosterLang}/${userConfig.portraitLogos ? '1' : '0'}.png`;
-        }
-
-        let itemGenres = item.genre_ids ? item.genre_ids.map(gId => genreMap[gId]).filter(Boolean) : [];
-        if (userConfig.listLang === 'non-en' && item.original_language) {
-            try {
-                const langName = new Intl.DisplayNames(['en'], { type: 'language' }).of(item.original_language);
-                if (langName) itemGenres.unshift(langName);
-            } catch {
-                itemGenres.unshift(item.original_language.toUpperCase());
-            }
-        }
-
-        const lTag = userConfig.landscapeTags ? (item._tag || 'none') : 'none';
-
-        return {
-            id: imdbId || `tmdb:${item.id}`,
-            _tmdbId: item.id,
-            name: item.title || item.name,
-            type: type,
-            genres: itemGenres,
-            description: item.overview || "",
-            background: `${ADDON_URL}/proxy-image-backdrop/${type}/${item.id}/${lTag}/${userConfig.landscapeRanked ? rank : 'none'}/${userConfig.landscapePosterLang}/${userConfig.landscapeLogos ? '1' : '0'}.png`,
-            poster: finalPosterUrl
-        };
+async function getTMDBIdFromImdb(imdbId) {
+  try {
+    const response = await axios.get(`${TMDB_BASE}/find/${imdbId}`, {
+      params: {
+        api_key: TMDB_API_KEY,
+        external_source: 'imdb_id'
+      }
     });
 
-    return { metas };
+    const movie = response.data.movie_results?.[0];
+    const tv = response.data.tv_results?.[0];
+
+    return movie?.id || tv?.id || null;
+  } catch (error) {
+    console.error(`Error finding TMDB ID for ${imdbId}:`, error.message);
+    return null;
+  }
+}
+
+/**
+ * Health check
+ */
+app.get('/', (req, res) => {
+  res.json({ status: 'OK', addon: manifest.name });
 });
 
-// ─── Backdrop route ───────────────────────────────────────────────────────────
-
-app.get(
-    ['/proxy-image-backdrop/:type/:id/:tag/:lang.png',
-        '/proxy-image-backdrop/:type/:id/:tag/:lang/:logos.png'],
-    async (req, res) => {
-        const { type, id, tag, lang, logos } = req.params;
-        const newUrl = `/proxy-image-backdrop/${type}/${id}/${tag}/none/${lang}${logos ? `/${logos}` : ''}.png`;
-        return res.redirect(301, newUrl);
-    }
-);
-
-app.get(
-    ['/proxy-image-backdrop/:type/:id/:tag/:rank/:lang.png',
-        '/proxy-image-backdrop/:type/:id/:tag/:rank/:lang/:logos.png'],
-    async (req, res) => {
-        if (await serveCached(req.originalUrl, res)) return;
-
-        try {
-            const { type, id, tag, rank, lang, logos } = req.params;
-            const tmdbType = type === 'series' ? 'tv' : 'movie';
-            const showLogos = logos === '1';
-            const tagText = parseTagText(tag);
-            const drawTag = !!tagText;
-            const drawRank = rank && rank !== 'none';
-
-            // ── 1. Fetch TMDB metadata ────────────────────────────────────────
-            const details = await fetchTmdbJson(`https://api.themoviedb.org/3/${tmdbType}/${id}?api_key=${TMDB_API_KEY}`);
-            const originalLang = details.original_language;
-
-            const fallbackLangs = ['en', 'null', 'ja', 'ko', 'es', 'fr', 'de', 'hi', 'it', 'pt', 'ru', 'zh', 'th', 'tr', 'pl', 'nl', 'sv', 'ar'];
-            const tmdbLangsSet = [...new Set([lang, originalLang, ...fallbackLangs])].filter(Boolean);
-            const allowedLangs = tmdbLangsSet.map(l => l === 'null' ? null : l);
-            const tmdbLangs = tmdbLangsSet.join(',');
-
-            const [images, providers] = await Promise.all([
-                fetchTmdbJson(`https://api.themoviedb.org/3/${tmdbType}/${id}/images?api_key=${TMDB_API_KEY}&include_image_language=${tmdbLangs}`),
-                showLogos ? fetchTmdbJson(`https://api.themoviedb.org/3/${tmdbType}/${id}/watch/providers?api_key=${TMDB_API_KEY}`) : Promise.resolve(null)
-            ]);
-
-            if (providers) details['watch/providers'] = providers;
-
-            if (images.backdrops) {
-                images.backdrops = images.backdrops.filter(b => allowedLangs.includes(b.iso_639_1));
-            }
-
-            const backdropLangToUse = lang === 'null' ? null : lang;
-            const backdrop = images.backdrops?.find(b => b.iso_639_1 === backdropLangToUse)
-                || (originalLang && images.backdrops?.find(b => b.iso_639_1 === originalLang))
-                || images.backdrops?.find(b => b.iso_639_1 === null)
-                || images.backdrops?.[0];
-
-            if (!backdrop?.file_path) {
-                return res.redirect(301, 'https://via.placeholder.com/1280x720.png?text=No+Background+Available');
-            }
-
-            let titleLogo = null;
-            if (lang !== 'null' && backdrop.iso_639_1 === null && images.logos && images.logos.length > 0) {
-                titleLogo = images.logos.find(l => l.iso_639_1 === lang)
-                    || (originalLang && images.logos.find(l => l.iso_639_1 === originalLang))
-                    || images.logos.find(l => l.iso_639_1 === 'en')
-                    || images.logos[0];
-            }
-
-            // Resolve logo info (sync, no fetch yet)
-            const logoInfo = showLogos ? resolveProviderLogoInfo(tmdbType, details) : null;
-
-            // Fast path: nothing to draw → just redirect
-            if (!drawTag && !drawRank && !logoInfo && !titleLogo) {
-                return res.redirect(301, `https://image.tmdb.org/t/p/original${backdrop.file_path}`);
-            }
-
-            // ── 2. Fetch backdrop image + provider logo in parallel ───────────
-            const [backdropBuffer, logoCompositeResult] = await Promise.all([
-                fetch(`https://image.tmdb.org/t/p/w1280${backdrop.file_path}`)
-                    .then(r => r.arrayBuffer())
-                    .then(ab => Buffer.from(ab)),
-                logoInfo
-                    ? (async () => { /* placeholder — computed after we know image dimensions */ return logoInfo; })()
-                    : Promise.resolve(null)
-            ]);
-
-            const backdropImage = sharp(backdropBuffer);
-            const metadata = await backdropImage.metadata();
-            const { width } = metadata;
-
-            // ── 3. Build rank SVG (sync, zero I/O) ───────────────────────────
-            let rankComposite = null;
-            if (drawRank) {
-                const fontSize = Math.round(metadata.height * 0.20);
-                const paddingTop = Math.round(metadata.height * 0.05);
-                const paddingLeft = Math.round(width * 0.05);
-                const fontStack = "'SF Pro Display', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif";
-
-                const rankSvg = `<svg width="${width}" height="${metadata.height}">
-                    <defs>
-                        <linearGradient id="rankGradient" x1="0%" y1="0%" x2="100%" y2="100%">
-                            <stop offset="0%"   style="stop-color:#ffffff;stop-opacity:1"/>
-                            <stop offset="60%"  style="stop-color:#c0c0c0;stop-opacity:1"/>
-                            <stop offset="100%" style="stop-color:#808080;stop-opacity:1"/>
-                        </linearGradient>
-                        <filter id="rankShadow" x="-10%" y="-10%" width="120%" height="120%">
-                            <feGaussianBlur in="SourceAlpha" stdDeviation="3"/>
-                            <feOffset dx="3" dy="3" result="offsetblur"/>
-                            <feFlood flood-color="black" flood-opacity="0.9"/>
-                            <feComposite in2="offsetblur" operator="in"/>
-                            <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
-                        </filter>
-                        <radialGradient id="shimmerGradient" cx="0%" cy="0%" r="100%" fx="0%" fy="0%">
-                            <stop offset="0%"   style="stop-color:black;stop-opacity:0.6"/>
-                            <stop offset="40%"  style="stop-color:black;stop-opacity:0.3"/>
-                            <stop offset="100%" style="stop-color:black;stop-opacity:0"/>
-                        </radialGradient>
-                    </defs>
-                    <rect x="0" y="0" width="${width * 0.4}" height="${fontSize * 1.5}" fill="url(#shimmerGradient)"/>
-                    <text x="${paddingLeft}" y="${paddingTop + fontSize / 1.1}" text-anchor="start"
-                          font-family="${fontStack}" font-size="${fontSize}"
-                          fill="url(#rankGradient)" fill-opacity="0.80" font-weight="bold"
-                          filter="url(#rankShadow)">${rank}</text>
-                </svg>`;
-
-                rankComposite = { input: Buffer.from(rankSvg), top: 0, left: 0 };
-            }
-
-            // ── 4. Tag composites + logo fetch run in parallel ────────────────
-            const [tagComposites, logoComposite, titleLogoComposite] = await Promise.all([
-                drawTag
-                    ? buildTagComposites(backdropBuffer, metadata, tagText, 0.15, 0.75)
-                    : Promise.resolve([]),
-                logoInfo
-                    ? buildLogoComposite(
-                        logoInfo.path,
-                        logoInfo.isNetwork,
-                        Math.round(width * 0.10),
-                        Math.round(metadata.height * 0.04),
-                        width,
-                        Math.round(metadata.height * 0.04)
-                    )
-                    : Promise.resolve(null),
-                titleLogo
-                    ? (async () => {
-                        try {
-                            const res = await fetch(`https://image.tmdb.org/t/p/original${titleLogo.file_path}`);
-                            if (!res.ok) return null;
-                            const buf = Buffer.from(await res.arrayBuffer());
-                            const targetWidth = Math.round(width * 0.50);
-                            const maxHeight = Math.round(metadata.height * 0.50);
-                            let resized = await sharp(buf)
-                                .resize({ width: targetWidth, height: maxHeight, fit: 'inside' })
-                                .png()
-                                .toBuffer();
-                            const meta = await sharp(resized).metadata();
-                            const paddingLeft = Math.round(width * 0.05);
-                            const paddingBottom = Math.round(metadata.height * 0.20);
-
-                            const targetLeft = paddingLeft;
-                            const targetTop = metadata.height - meta.height - paddingBottom;
-
-                            // Sharp throws an error if the composite overlay is larger than the base image
-                            const extractLeft = Math.max(0, -targetLeft);
-                            const extractTop = Math.max(0, -targetTop);
-                            const extractRight = Math.min(meta.width, width - targetLeft);
-                            const extractBottom = Math.min(meta.height, metadata.height - targetTop);
-
-                            const extractWidth = extractRight - extractLeft;
-                            const extractHeight = extractBottom - extractTop;
-
-                            if (extractWidth <= 0 || extractHeight <= 0) return null;
-
-                            if (extractWidth < meta.width || extractHeight < meta.height) {
-                                resized = await sharp(resized)
-                                    .extract({ left: extractLeft, top: extractTop, width: extractWidth, height: extractHeight })
-                                    .toBuffer();
-                            }
-
-                            return {
-                                input: resized,
-                                left: targetLeft + extractLeft,
-                                top: targetTop + extractTop
-                            };
-                        } catch (e) {
-                            console.error("Title logo error:", e);
-                            return null;
-                        }
-                    })()
-                    : Promise.resolve(null)
-            ]);
-
-            const compositeOperations = [
-                ...(rankComposite ? [rankComposite] : []),
-                ...tagComposites,
-                ...(titleLogoComposite ? [titleLogoComposite] : []),
-                ...(logoComposite ? [logoComposite] : [])
-            ];
-
-            const finalImageBuffer = await backdropImage
-                .composite(compositeOperations)
-                .png()
-                .toBuffer();
-
-            cacheAndSend(req.originalUrl, finalImageBuffer, res);
-        } catch (error) {
-            console.error("Backdrop generation error:", error);
-            res.status(500).send("Error generating image");
-        }
-    }
-);
-
-// ─── Poster route ─────────────────────────────────────────────────────────────
-
-app.get(
-    ['/proxy-image-poster/:type/:id/:tag/:rank/:lang.png',
-        '/proxy-image-poster/:type/:id/:tag/:rank/:lang/:logos.png'],
-    async (req, res) => {
-        if (await serveCached(req.originalUrl, res)) return;
-
-        try {
-            const { type, id, tag, rank, lang, logos } = req.params;
-            const tmdbType = type === 'series' ? 'tv' : 'movie';
-            const showLogos = logos === '1';
-            const tagText = parseTagText(tag);
-            const drawTag = !!tagText;
-            const drawRank = rank && rank !== 'none';
-
-            // ── 1. Fetch TMDB metadata ────────────────────────────────────────
-            const details = await fetchTmdbJson(`https://api.themoviedb.org/3/${tmdbType}/${id}?api_key=${TMDB_API_KEY}`);
-            const originalLang = details.original_language;
-
-            const fallbackLangs = ['en', 'null', 'ja', 'ko', 'es', 'fr', 'de', 'hi', 'it', 'pt', 'ru', 'zh', 'th', 'tr', 'pl', 'nl', 'sv', 'ar'];
-            const tmdbLangsSet = [...new Set([lang, originalLang, ...fallbackLangs])].filter(Boolean);
-            const allowedLangs = tmdbLangsSet.map(l => l === 'null' ? null : l);
-            const tmdbLangs = tmdbLangsSet.join(',');
-
-            const [images, providers] = await Promise.all([
-                fetchTmdbJson(`https://api.themoviedb.org/3/${tmdbType}/${id}/images?api_key=${TMDB_API_KEY}&include_image_language=${tmdbLangs}`),
-                showLogos ? fetchTmdbJson(`https://api.themoviedb.org/3/${tmdbType}/${id}/watch/providers?api_key=${TMDB_API_KEY}`) : Promise.resolve(null)
-            ]);
-
-            if (providers) details['watch/providers'] = providers;
-
-            if (images.posters) {
-                images.posters = images.posters.filter(p => allowedLangs.includes(p.iso_639_1));
-            }
-
-            const posterLangToUse = lang === 'null' ? null : lang;
-            const poster = images.posters?.find(p => p.iso_639_1 === posterLangToUse)
-                || (originalLang && images.posters?.find(p => p.iso_639_1 === originalLang))
-                || images.posters?.find(p => p.iso_639_1 === null)
-                || images.posters?.find(p => p.iso_639_1 === 'en')
-                || images.posters?.[0];
-
-            if (!poster?.file_path) {
-                return res.redirect(301, 'https://via.placeholder.com/500x750.png?text=Poster+Unavailable');
-            }
-
-            // Resolve logo info (sync, no fetch yet)
-            const logoInfo = showLogos ? resolveProviderLogoInfo(tmdbType, details) : null;
-
-            // Fast path: nothing to draw → just redirect
-            if (!drawTag && !drawRank && !logoInfo) {
-                return res.redirect(301, `https://image.tmdb.org/t/p/w500${poster.file_path}`);
-            }
-
-            // ── 2. Fetch poster image (logo fetch is deferred until we have width) ──
-            const posterBuffer = await fetch(`https://image.tmdb.org/t/p/w500${poster.file_path}`)
-                .then(r => r.arrayBuffer())
-                .then(ab => Buffer.from(ab));
-
-            const posterImage = sharp(posterBuffer);
-            const metadata = await posterImage.metadata();
-            const { width } = metadata;
-
-            // ── 3. Build rank SVG (sync, zero I/O) ───────────────────────────
-            let rankComposite = null;
-            if (drawRank) {
-                const fontSize = Math.round(width * 0.30);
-                const paddingTop = Math.round(width * 0.08);
-                const paddingLeft = Math.round(width * 0.08);
-                const fontStack = "'SF Pro Display', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif";
-
-                const rankSvg = `<svg width="${width}" height="${metadata.height}">
-                    <defs>
-                        <linearGradient id="rankGradient" x1="0%" y1="0%" x2="100%" y2="100%">
-                            <stop offset="0%"   style="stop-color:#ffffff;stop-opacity:1"/>
-                            <stop offset="60%"  style="stop-color:#c0c0c0;stop-opacity:1"/>
-                            <stop offset="100%" style="stop-color:#808080;stop-opacity:1"/>
-                        </linearGradient>
-                        <filter id="rankShadow" x="-10%" y="-10%" width="120%" height="120%">
-                            <feGaussianBlur in="SourceAlpha" stdDeviation="3"/>
-                            <feOffset dx="3" dy="3" result="offsetblur"/>
-                            <feFlood flood-color="black" flood-opacity="0.9"/>
-                            <feComposite in2="offsetblur" operator="in"/>
-                            <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
-                        </filter>
-                        <radialGradient id="shimmerGradient" cx="0%" cy="0%" r="100%" fx="0%" fy="0%">
-                            <stop offset="0%"   style="stop-color:black;stop-opacity:0.6"/>
-                            <stop offset="40%"  style="stop-color:black;stop-opacity:0.3"/>
-                            <stop offset="100%" style="stop-color:black;stop-opacity:0"/>
-                        </radialGradient>
-                    </defs>
-                    <rect x="0" y="0" width="${width * 0.6}" height="${fontSize * 2}" fill="url(#shimmerGradient)"/>
-                    <text x="${paddingLeft}" y="${paddingTop + fontSize / 1.3}" text-anchor="start"
-                          font-family="${fontStack}" font-size="${fontSize}"
-                          fill="url(#rankGradient)" fill-opacity="0.80" font-weight="bold"
-                          filter="url(#rankShadow)">${rank}</text>
-                </svg>`;
-
-                rankComposite = { input: Buffer.from(rankSvg), top: 0, left: 0 };
-            }
-
-            // ── 4. Tag composites + logo fetch run in parallel ────────────────
-            const [tagComposites, logoComposite] = await Promise.all([
-                drawTag
-                    ? buildTagComposites(posterBuffer, metadata, tagText, 0.08, 0.60)
-                    : Promise.resolve([]),
-                logoInfo
-                    ? buildLogoComposite(
-                        logoInfo.path,
-                        logoInfo.isNetwork,
-                        Math.round(width * 0.15),
-                        Math.round(width * 0.04),
-                        width,
-                        Math.round(width * 0.04)
-                    )
-                    : Promise.resolve(null)
-            ]);
-
-            const compositeOperations = [
-                ...(rankComposite ? [rankComposite] : []),
-                ...tagComposites,
-                ...(logoComposite ? [logoComposite] : [])
-            ];
-
-            const finalImageBuffer = await posterImage
-                .composite(compositeOperations)
-                .png()
-                .toBuffer();
-
-            cacheAndSend(req.originalUrl, finalImageBuffer, res);
-        } catch (error) {
-            console.error("Poster generation error:", error);
-            res.status(500).send("Error generating image");
-        }
-    }
-);
-
-// ─── Config UI ────────────────────────────────────────────────────────────────
-
-const configUI = `<!DOCTYPE html>
-<html>
-<head>
-    <title>TMDB Top Today</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><circle cx=%2250%22 cy=%2250%22 r=%2250%22 fill=%22%238b0000%22/><path d=%22M25 70 l15 -25 l15 15 l20 -30%22 fill=%22none%22 stroke=%22white%22 stroke-width=%228%22 stroke-linecap=%22round%22 stroke-linejoin=%22round%22/><path d=%22M55 30 h20 v20%22 fill=%22none%22 stroke=%22white%22 stroke-width=%228%22 stroke-linecap=%22round%22 stroke-linejoin=%22round%22/></svg>">
-    <style>
-        body { font-family: 'SF Pro Display', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #121212; color: #fff; margin: 0; padding: 20px; box-sizing: border-box; height: 100vh; overflow: hidden; }
-        .wrapper { display: flex; flex-direction: row; gap: 30px; width: 100%; height: 100%; max-width: none; align-items: stretch; }
-        .container { background-color: #1e1e1e; padding: 30px; border-radius: 12px; box-shadow: 0 10px 30px rgba(0,0,0,.5); flex: 0 0 420px; min-width: 420px; box-sizing: border-box; display: flex; flex-direction: column; height: 100%; max-height: 100%; overflow-y: auto; }
-        .preview-container { background-color: #1e1e1e; padding: 30px; border-radius: 12px; box-shadow: 0 10px 30px rgba(0,0,0,.5); flex: 1; min-width: 0; box-sizing: border-box; display: flex; flex-direction: column; height: 100%; max-height: 100%; overflow-y: auto; }
-        h2 { margin-top: 0; text-align: center; color: #e0e0e0; margin-bottom: 25px; }
-        .form-group { margin-bottom: 20px; }
-        label { display: block; margin-bottom: 8px; font-weight: 600; font-size: 14px; color: #b3b3b3; }
-        select { width: 100%; padding: 12px; border-radius: 6px; border: 1px solid #333; background: #2a2a2a; color: #fff; font-size: 14px; outline: none; box-sizing: border-box; }
-        select:focus { border-color: #8b0000; }
-        .checkbox-group { display: flex; align-items: center; background: #2a2a2a; padding: 12px; border-radius: 6px; border: 1px solid #333; cursor: pointer; margin-bottom: 10px; }
-        .checkbox-group input { margin-right: 12px; width: 18px; height: 18px; cursor: pointer; accent-color: #8b0000; }
-        .checkbox-group span { margin-bottom: 0; cursor: pointer; color: #fff; font-size: 15px; }
-        .link-container { display: flex; gap: 10px; margin-top: 5px; }
-        .link-container input { flex-grow: 1; padding: 12px; border-radius: 6px; border: 1px solid #333; background: #2a2a2a; color: #aaa; font-size: 13px; outline: none; }
-        .link-container button { width: auto; margin-top: 0; padding: 0 20px; background-color: #8b0000; color: #fff; font-size: 14px; font-weight: 700; border: none; border-radius: 6px; cursor: pointer; transition: background .2s; }
-        .link-container button:hover { background-color: #660000; }
-        .main-btn { width: 100%; padding: 14px; border: none; border-radius: 6px; background-color: #8b0000; color: #fff; font-size: 16px; font-weight: 700; cursor: pointer; transition: background .2s; }
-        .main-btn:hover { background-color: #660000; }
-        .preview-section { width: 100%; }
-        .row-title { color: #e0e0e0; margin: 0 0 15px 0; font-size: 16px; border-bottom: 1px solid #333; padding-bottom: 8px; }
-        .horizontal-scroll { display: flex; overflow-x: auto; gap: 15px; padding-bottom: 15px; align-items: flex-start; }
-        .horizontal-scroll::-webkit-scrollbar { height: 8px; }
-        .horizontal-scroll::-webkit-scrollbar-track { background: #2a2a2a; border-radius: 4px; }
-        .horizontal-scroll::-webkit-scrollbar-thumb { background: #555; border-radius: 4px; }
-        .horizontal-scroll::-webkit-scrollbar-thumb:hover { background: #8b0000; }
-        .item-card { display: flex; flex-direction: column; gap: 10px; text-decoration: none; }
-        .item-card.landscape { width: 280px; }
-        .item-card.portrait { width: 150px; }
-        .item-card img { object-fit: cover; border-radius: 6px; background-color: #2a2a2a; }
-        .item-card.landscape img { width: 280px; aspect-ratio: 16/9; }
-        .item-card.portrait img { width: 150px; aspect-ratio: 2/3; }
-        .item-title { font-size: 13px; color: #b3b3b3; text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; width: 100%; margin: 0; }
-        .loading { color: #aaa; font-style: italic; font-size: 14px; padding: 20px 0; text-align: center; width: 100%; align-self: center; }
-        .multi-select { position: relative; width: 100%; margin-bottom: 15px; user-select: none; }
-        .select-box { padding: 12px; border-radius: 6px; border: 1px solid #333; background: #2a2a2a; color: #fff; font-size: 14px; cursor: pointer; display: flex; justify-content: space-between; align-items: center; }
-        .select-box::after { content: "▼"; font-size: 10px; color: #aaa; }
-        .options-container { position: absolute; top: 100%; left: 0; right: 0; background: #2a2a2a; border: 1px solid #333; border-radius: 6px; max-height: 200px; overflow-y: auto; z-index: 100; display: none; flex-direction: column; margin-top: 4px; box-shadow: 0 4px 10px rgba(0,0,0,0.5); }
-        .options-container.show { display: flex; }
-        .options-container label { padding: 10px 12px; margin: 0; cursor: pointer; display: flex; align-items: center; border-bottom: 1px solid #333; color: #fff; font-size: 14px; font-weight: 400; }
-        .options-container label:last-child { border-bottom: none; }
-        .options-container label:hover { background: #333; }
-        .options-container input { margin-right: 10px; width: 16px; height: 16px; accent-color: #8b0000; cursor: pointer; }
-        .tooltip { position: relative; display: inline-flex; justify-content: center; align-items: center; background: #444; color: #ddd; border-radius: 50%; width: 16px; height: 16px; font-size: 12px; font-weight: bold; margin-left: 6px; cursor: help; }
-        .tooltip .tooltiptext { visibility: hidden; width: 220px; background-color: #333; color: #fff; text-align: center; border-radius: 6px; padding: 8px; position: absolute; z-index: 10; bottom: 100%; left: -20px; margin-bottom: 10px; opacity: 0; transition: opacity 0.2s; font-size: 12px; font-weight: 400; box-shadow: 0 4px 10px rgba(0,0,0,0.5); pointer-events: none; line-height: 1.4; }
-        .tooltip .tooltiptext::after { content: ""; position: absolute; top: 100%; left: 28px; margin-left: -5px; border-width: 5px; border-style: solid; border-color: #333 transparent transparent transparent; }
-        .tooltip:hover .tooltiptext { visibility: visible; opacity: 1; }
-        @media (max-width: 768px) {
-            body { padding: 10px; height: auto; overflow: auto; }
-            .wrapper { flex-direction: column; height: auto; }
-            .container, .preview-container { flex: none; width: 100%; max-width: 100%; min-width: 0; height: auto; max-height: none; overflow-y: visible; padding: 20px; }
-            .item-card.landscape { width: 220px; }
-            .item-card.landscape img { width: 220px; }
-            .item-card.portrait { width: 120px; }
-            .item-card.portrait img { width: 120px; }
-        }
-    </style>
-</head>
-<body>
-    <div class="wrapper">
-        <div class="container">
-            <h2>TMDB Top Today</h2>
-
-            <div class="form-group">
-                <h3 style="color: #e0e0e0; margin: 0 0 15px 0; font-size: 16px; border-bottom: 1px solid #333; padding-bottom: 8px;">Catalog Filters</h3>
-                <label>Language</label>
-                <div class="multi-select" id="listLangSelect">
-                    <div class="select-box" onclick="toggleMultiSelect()">English</div>
-                    <div class="options-container" id="listLangOptions">
-                        <label><input type="checkbox" value="all" onchange="handleLangChange(this)"> All</label>
-                        <label><input type="checkbox" value="en" checked onchange="handleLangChange(this)"> English</label>
-                        <label><input type="checkbox" value="non-en" onchange="handleLangChange(this)"> Global (non English)</label>
-                        <label><input type="checkbox" value="ja" onchange="handleLangChange(this)"> Japanese</label>
-                        <label><input type="checkbox" value="ko" onchange="handleLangChange(this)"> Korean</label>
-                        <label><input type="checkbox" value="es" onchange="handleLangChange(this)"> Spanish</label>
-                        <label><input type="checkbox" value="fr" onchange="handleLangChange(this)"> French</label>
-                        <label><input type="checkbox" value="de" onchange="handleLangChange(this)"> German</label>
-                        <label><input type="checkbox" value="hi" onchange="handleLangChange(this)"> Hindi</label>
-                    </div>
-                </div>
-                <label class="checkbox-group" for="digitalOnly"><input type="checkbox" id="digitalOnly" checked onchange="updateLink()"><span>Filter Movies Not Released Digitally</span></label>
-            </div>
-            
-            <div class="form-group">
-                <h3 style="color: #e0e0e0; margin: 0 0 15px 0; font-size: 16px; border-bottom: 1px solid #333; padding-bottom: 8px;">Poster Config</h3>
-                <div style="display: flex; justify-content: space-between; margin-bottom: 10px; color: #b3b3b3; font-weight: 600; font-size: 14px; padding: 0 10px;">
-                    <span style="flex: 1.5;">Config</span>
-                    <span style="flex: 1; text-align: center;">Landscape</span>
-                    <span style="flex: 1; text-align: center;">Portrait</span>
-                </div>
-                <div style="display: flex; justify-content: space-between; align-items: center; background: #2a2a2a; padding: 12px; border-radius: 6px; border: 1px solid #333; margin-bottom: 10px;">
-                    <span style="flex: 1.5; color: #fff; font-size: 15px;">Tags</span>
-                    <div style="flex: 1; text-align: center;"><input type="checkbox" id="landscapeTags" checked onchange="updateLink()" style="width: 18px; height: 18px; accent-color: #8b0000; cursor: pointer;"></div>
-                    <div style="flex: 1; text-align: center;"><input type="checkbox" id="portraitTags" checked onchange="updateLink()" style="width: 18px; height: 18px; accent-color: #8b0000; cursor: pointer;"></div>
-                </div>
-                <div style="display: flex; justify-content: space-between; align-items: center; background: #2a2a2a; padding: 12px; border-radius: 6px; border: 1px solid #333; margin-bottom: 10px;">
-                    <span style="flex: 1.5; color: #fff; font-size: 15px;">Streaming Logos</span>
-                    <div style="flex: 1; text-align: center;"><input type="checkbox" id="landscapeLogos" onchange="updateLink()" style="width: 18px; height: 18px; accent-color: #8b0000; cursor: pointer;"></div>
-                    <div style="flex: 1; text-align: center;"><input type="checkbox" id="portraitLogos" onchange="updateLink()" style="width: 18px; height: 18px; accent-color: #8b0000; cursor: pointer;"></div>
-                </div>
-                <div style="display: flex; justify-content: space-between; align-items: center; background: #2a2a2a; padding: 12px; border-radius: 6px; border: 1px solid #333; margin-bottom: 10px;">
-                    <span style="flex: 1.5; color: #fff; font-size: 15px;">Ranked</span>
-                    <div style="flex: 1; text-align: center;"><input type="checkbox" id="landscapeRanked" onchange="updateLink()" style="width: 18px; height: 18px; accent-color: #8b0000; cursor: pointer;"></div>
-                    <div style="flex: 1; text-align: center;"><input type="checkbox" id="portraitRanked" checked onchange="updateLink()" style="width: 18px; height: 18px; accent-color: #8b0000; cursor: pointer;"></div>
-                </div>
-                <div style="display: flex; justify-content: space-between; align-items: center; background: #2a2a2a; padding: 12px; border-radius: 6px; border: 1px solid #333; margin-bottom: 10px;">
-                    <span style="flex: 1.5; color: #fff; font-size: 15px;">Language <span class="tooltip">?<span class="tooltiptext">If unavailable, falls back to media source language.</span></span></span>
-                    <div style="flex: 2; text-align: center;">
-                        <select id="posterLang" onchange="updateLink()" style="width: 97.5%; padding: 6px; font-size: 12px; background: #1e1e1e; border: 1px solid #444; color: #fff; border-radius: 4px; outline: none;"><option value="en" selected>English</option><option value="ja">Japanese</option><option value="ko">Korean</option><option value="es">Spanish</option><option value="fr">French</option><option value="de">German</option><option value="hi">Hindi</option><option value="null">Textless</option></select>
-                    </div>
-                </div>
-            </div>
-            
-            <div style="margin-top: auto;">
-                <div class="form-group">
-                    <label>Manifest URL</label>
-                    <div class="link-container">
-                        <input type="text" id="manifestUrl" readonly>
-                        <button id="copyBtn" onclick="copyLink()">Copy</button>
-                    </div>
-                </div>
-                <button id="installBtn" class="main-btn">Install</button>
-            </div>
-        </div>
-        
-        <div class="preview-container">
-            <div style="display: flex; justify-content: space-between; align-items: center; width: 100%; margin-bottom: 25px;">
-                <h2 style="margin: 0;">Catalog Preview</h2>
-                <select id="previewMode" onchange="renderCurrentData()" style="width: auto; padding: 8px; margin-bottom: 0;">
-                    <option value="landscape" selected>Landscape</option>
-                    <option value="portrait">Portrait</option>
-                </select>
-            </div>
-            <div class="preview-section">
-                <h3 class="row-title">Top Shows Today</h3>
-                <div id="shows-preview" class="horizontal-scroll"><div class="loading">Loading shows...</div></div>
-            </div>
-            <div class="preview-section" style="margin-top: 20px;">
-                <h3 class="row-title">Top Movies Today</h3>
-                <div id="movies-preview" class="horizontal-scroll"><div class="loading">Loading movies...</div></div>
-            </div>
-        </div>
-    </div>
-    <script>
-        let previewTimeout;
-        let currentShows = [];
-        let currentMovies = [];
-
-        function toggleMultiSelect() {
-            document.getElementById('listLangOptions').classList.toggle('show');
-        }
-
-        document.addEventListener('click', function(e) {
-            if (!e.target.closest('.multi-select')) {
-                const opts = document.getElementById('listLangOptions');
-                if (opts) opts.classList.remove('show');
-            }
-        });
-
-        function handleLangChange(cb) {
-            if ((cb.value === 'all' || cb.value === 'non-en') && cb.checked) {
-                document.querySelectorAll('#listLangOptions input').forEach(input => {
-                    if (input !== cb) input.checked = false;
-                });
-            } else if (cb.checked) {
-                const allCb = document.querySelector('#listLangOptions input[value="all"]');
-                if (allCb) allCb.checked = false;
-                const nonEnCb = document.querySelector('#listLangOptions input[value="non-en"]');
-                if (nonEnCb) nonEnCb.checked = false;
-            }
-            updateLink();
-        }
-
-        function updateLink() {
-            const lt = document.getElementById('landscapeTags').checked,
-                  llo = document.getElementById('landscapeLogos').checked,
-                  lr = document.getElementById('landscapeRanked').checked,
-                  pt = document.getElementById('portraitTags').checked,
-                  plo = document.getElementById('portraitLogos').checked,
-                  pr_chk = document.getElementById('portraitRanked').checked,
-                  plang = document.getElementById('posterLang').value,
-                  d = document.getElementById('digitalOnly').checked;
-                  
-            const checkedLangs = Array.from(document.querySelectorAll('#listLangOptions input:checked'));
-            const l = checkedLangs.map(opt => opt.value).join(',') || 'all';
-            
-            const box = document.querySelector('.select-box');
-            if (checkedLangs.length === 0) box.textContent = 'All';
-            else if (checkedLangs.length <= 2) box.textContent = checkedLangs.map(cb => cb.parentElement.textContent.trim()).join(', ');
-            else box.textContent = checkedLangs.length + ' Languages Selected';
-                  
-            const c = "landscapeTags=" + lt + "|landscapeLogos=" + llo + "|landscapeRanked=" + lr + "|portraitTags=" + pt + "|portraitLogos=" + plo + "|portraitRanked=" + pr_chk + "|posterLang=" + plang + "|digitalOnly=" + d + "|listLang=" + l;
-            const h = window.location.host, pr = window.location.protocol;
-            
-            document.getElementById('manifestUrl').value = pr + "//" + h + "/" + c + "/manifest.json";
-            document.getElementById('installBtn').onclick = () => { window.location.href = "stremio://" + h + "/" + c + "/manifest.json" };
-            
-            clearTimeout(previewTimeout);
-            previewTimeout = setTimeout(() => updatePreviews(c, pr, h), 500);
-        }
-        
-        async function updatePreviews(config, pr, h) {
-            const showsContainer = document.getElementById('shows-preview');
-            const moviesContainer = document.getElementById('movies-preview');
-            
-            showsContainer.innerHTML = '<div class="loading">Loading shows...</div>';
-            moviesContainer.innerHTML = '<div class="loading">Loading movies...</div>';
-            
-            try {
-                const [showsRes, moviesRes] = await Promise.all([
-                    fetch(pr + "//" + h + "/" + config + "/catalog/series/top_shows_today.json"),
-                    fetch(pr + "//" + h + "/" + config + "/catalog/movie/top_movies_today.json")
-                ]);
-                
-                const showsData = await showsRes.json();
-                const moviesData = await moviesRes.json();
-                
-                currentShows = showsData.metas || [];
-                currentMovies = moviesData.metas || [];
-                
-                renderCurrentData();
-                
-            } catch (err) {
-                showsContainer.innerHTML = '<div class="loading">Error loading preview</div>';
-                moviesContainer.innerHTML = '<div class="loading">Error loading preview</div>';
-            }
-        }
-        
-        function renderCurrentData() {
-            const showsContainer = document.getElementById('shows-preview');
-            const moviesContainer = document.getElementById('movies-preview');
-            const mode = document.getElementById('previewMode').value;
-            
-            const renderItems = (items) => {
-                if (!items || items.length === 0) return '<div class="loading">No items found</div>';
-                return items.slice(0, 10).map(item => {
-                    const tmdbId = item._tmdbId || item.id.replace('tmdb:', '').replace('tt', '');
-                    const tmdbType = item.type === 'series' ? 'tv' : 'movie';
-                    const imgTag = mode === 'landscape' 
-                        ? '<img src="' + item.background + '" alt="bg" loading="lazy" />'
-                        : '<img src="' + item.poster + '" alt="poster" loading="lazy" />';
-                    return '<a href="https://www.themoviedb.org/' + tmdbType + '/' + tmdbId + '" target="_blank" class="item-card ' + mode + '">' +
-                           imgTag + 
-                           '<p class="item-title" title="' + item.name + '">' + item.name + '</p>' + 
-                           '</a>';
-                }).join('');
-            };
-            
-            showsContainer.innerHTML = renderItems(currentShows);
-            moviesContainer.innerHTML = renderItems(currentMovies);
-        }
-        
-        function copyLink() {
-            const c = document.getElementById("manifestUrl");
-            c.select();
-            c.setSelectionRange(0, 99999);
-            navigator.clipboard.writeText(c.value).then(() => {
-                const b = document.getElementById("copyBtn");
-                const o = b.innerText;
-                b.innerText = "Copied!";
-                b.style.backgroundColor = "#660000";
-                setTimeout(() => { b.innerText = o; b.style.backgroundColor = "#8b0000" }, 2000);
-            });
-        }
-        updateLink();
-    </script>
-</body>
-</html>`;
-
-// ─── Route plumbing (unchanged) ───────────────────────────────────────────────
-
-const parseConfig = (configStr) => {
-    const configObj = {};
-    if (configStr) {
-        configStr.split('|').forEach(pair => {
-            const [key, val] = pair.split('=');
-            if (key && val) configObj[key] = decodeURIComponent(val);
-        });
-    }
-    return configObj;
-};
-
-const addonInterface = builder.getInterface();
-
-app.get('/', (req, res) => res.send(configUI));
-app.get('/configure', (req, res) => res.send(configUI));
-app.get('/manifest.json', (req, res) => res.json(addonInterface.manifest));
-app.get('/:config/manifest.json', (req, res) => {
-    const configuredManifest = JSON.parse(JSON.stringify(addonInterface.manifest));
-    if (configuredManifest.behaviorHints) configuredManifest.behaviorHints.configurationRequired = false;
-    res.json(configuredManifest);
+// ===== INICIAR SERVIDOR =====
+app.listen(ADDON_PORT, () => {
+  console.log(`🎬 Addon Top 10 TMDB corriendo en puerto ${ADDON_PORT}`);
+  console.log(`📋 Manifiesto en http://localhost:${ADDON_PORT}/manifest.json`);
+  console.log(`🔗 Añade a Stremio: http://localhost:${ADDON_PORT}/manifest.json`);
 });
 
-app.get('/catalog/:type/:id.json', async (req, res) => {
-    try {
-        res.json(await addonInterface.get('catalog', req.params.type, req.params.id, { config: {} }));
-    } catch { res.status(500).json({ err: "Internal Server Error" }); }
-});
-
-app.get('/catalog/:type/:id/:extra.json', async (req, res) => {
-    try {
-        res.json(await addonInterface.get('catalog', req.params.type, req.params.id, { config: {} }));
-    } catch { res.status(500).json({ err: "Internal Server Error" }); }
-});
-
-app.get('/:config/catalog/:type/:id.json', async (req, res) => {
-    try {
-        res.json(await addonInterface.get('catalog', req.params.type, req.params.id, { config: parseConfig(req.params.config) }));
-    } catch { res.status(500).json({ err: "Internal Server Error" }); }
-});
-
-app.get('/:config/catalog/:type/:id/:extra.json', async (req, res) => {
-    try {
-        res.json(await addonInterface.get('catalog', req.params.type, req.params.id, { config: parseConfig(req.params.config) }));
-    } catch { res.status(500).json({ err: "Internal Server Error" }); }
-});
-
-const PORT = process.env.PORT || 7000;
-app.listen(PORT, () => console.log(`Addon active on port ${PORT}`));
+module.exports = app;
+           
